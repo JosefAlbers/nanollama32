@@ -1,12 +1,28 @@
 import json
-import os
 import time
-
+import base64
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
+import tiktoken
+
+class Tokenizer:
+    def __init__(self, path_tok):
+        with open(path_tok) as f:
+            ranks = {base64.b64decode(token): int(rank) for token, rank in (line.split() for line in f if line)}
+        n_vocab = len(ranks)
+        specials = ["<|begin_of_text|>", "<|end_of_text|>", "<|reserved_special_token_0|>", "<|reserved_special_token_1|>", "<|finetune_right_pad_id|>", "<|step_id|>", "<|start_header_id|>", "<|end_header_id|>", "<|eom_id|>", "<|eot_id|>", "<|python_tag|>", *[f"<|reserved_special_token_{2 + i}|>" for i in range(245)]]
+        special_tokens = {k:(n_vocab+i) for i,k in enumerate(specials)}
+        self.encoding = tiktoken.Encoding(name='jj', explicit_n_vocab=n_vocab + len(special_tokens), pat_str=r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", mergeable_ranks=ranks, special_tokens=special_tokens)
+    def encode(self, lot):
+        if isinstance(lot, str):
+            lot = [lot]
+        return [self.encoding.encode(t, allowed_special='all') for t in lot]
+    def decode(self, lol):
+        if isinstance(lol[0], int):
+            lol = [lol]
+        return [self.encoding.decode(l) for l in lol]
 
 CHAT = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -149,21 +165,21 @@ class Model(nn.Module):
 
 class Chat:
     def __init__(self):
-        path_hf = snapshot_download(repo_id='meta-llama/Llama-3.2-1B-Instruct', allow_patterns=["model.safetensors", "config.json"], token=os.getenv('HF_READ_TOKEN'))
-        with open(f'{path_hf}/config.json', 'r') as f:
+        path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=["llama_32_1b_it*"])
+        with open(f'{path_hf}/llama_32_1b_it_config.json', 'r') as f:
             cfg = json.load(f)
         model = Model(cfg)
-        model.load_weights(f'{path_hf}/model.safetensors', strict=False)
+        model.load_weights(f'{path_hf}/llama_32_1b_it_model.safetensors', strict=False)
         model.eval()
         mx.eval(model)
         self.model = model
-        self.tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.2-1B-Instruct', token=os.getenv('HF_READ_TOKEN'))
+        self.tokenizer = Tokenizer(f'{path_hf}/llama_32_1b_it.tiktoken')
     def __call__(self, inputs, max_new=500, verbose=True):
         tic = time.perf_counter()
         if isinstance(inputs, str):
             inputs = [inputs]
         assert len(inputs) == 1, 'Batching is not implemented yet'
-        inputs = self.tokenizer([CHAT.format(text=i) for i in inputs], add_special_tokens=False)['input_ids']
+        inputs = self.tokenizer.encode([CHAT.format(text=i) for i in inputs])
         toks, pids, mask = self.pad_to_batch(inputs)
         cache = None
         result = mx.zeros((toks.shape[0],0), dtype=mx.uint32)
@@ -178,12 +194,12 @@ class Chat:
             goon *= (toks != 128009) # <|eot_id|>
             if goon.sum() < 1:
                 break
-        text = self.tokenizer.batch_decode(result.tolist())
+        text = self.tokenizer.decode(result.tolist())
         if verbose:
             tic = time.perf_counter()-tic
             num = result.size
             tps = num/tic
-            print(f'{self.tokenizer.batch_decode(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(text)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
+            print(f'{self.tokenizer.decode(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(text)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
         return text
     @staticmethod
     def pad_to_batch(input_ids):
@@ -193,28 +209,27 @@ class Chat:
         mask = mx.array([[0]*(max_length-len(sublist)) + [1]*len(sublist) for sublist in input_ids])
         return toks, pids, mask
 
-# inputs = ['Guten Tag', 'How are you']
-inputs = "What's the weather right now in LA?"
-
 chat = Chat()
-chat(inputs)
+chat("What's the weather right now in Busan?")
 
-# ["<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 25 Oct 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather right now in LA?<|eot_id|>"]
+# ["<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 25 Oct 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather right now in Busan?<|eot_id|>"]
 
 # ---
 
 # <|start_header_id|>assistant<|end_header_id|>
 
-# I'm not capable of providing real-time weather information. However, I can suggest some ways for you to find out the current weather in Los Angeles.
+# However, I'm a large language model, I don't have real-time access to current weather conditions. But I can suggest some ways for you to find out the current weather in Busan.
 
-# You can check the weather forecast for Los Angeles by:
+# You can:
 
-# 1. Visiting a weather website, such as weather.com or accuweather.com, which provide up-to-date weather forecasts and conditions for various locations, including Los Angeles.
-# 2. Using a mobile app, such as Dark Sky or Weather Underground, which offer real-time weather information and forecasts for specific locations.
-# 3. Telling a voice assistant, such as Siri, Google Assistant, or Alexa, which can provide you with the current weather conditions in Los Angeles.
+# 1. Check online weather websites or apps, such as AccuWeather, Weather.com, or the Korea Meteorological Administration (KMA) website.
+# 2. Use a mobile app like Dark Sky or Weather Underground, which provide current weather conditions and forecasts for Busan.
+# 3. Tune into local news or radio stations, which often provide weather updates.
 
-# Please note that I'm an AI, and my knowledge cutoff is December 2023. I may not have the most up-to-date information on current weather conditions.<|eot_id|>
+# Please note that the weather can change rapidly, so it's always a good idea to check multiple sources for the most up-to-date information.
+
+# If you'd like, I can also provide you with general information about the climate and weather patterns in Busan.<|eot_id|>
 
 # ---
 
-# 58.59 tps (172 in 2.94 seconds)
+# 65.66 tps (168 in 2.56 seconds)
