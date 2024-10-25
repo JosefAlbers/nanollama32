@@ -8,8 +8,7 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
-CHAT = """
-<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+CHAT = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Cutting Knowledge Date: December 2023
 Today Date: 25 Oct 2024
@@ -163,8 +162,8 @@ class Chat:
         tic = time.perf_counter()
         if isinstance(inputs, str):
             inputs = [inputs]
-        # assert len(inputs) == 1 'Batching is not implemented yet'
-        inputs = self.tokenizer([CHAT.format(text=i) for i in inputs])['input_ids']
+        assert len(inputs) == 1, 'Batching is not implemented yet'
+        inputs = self.tokenizer([CHAT.format(text=i) for i in inputs], add_special_tokens=False)['input_ids']
         toks, pids, mask = self.pad_to_batch(inputs)
         cache = None
         result = mx.zeros((toks.shape[0],0), dtype=mx.uint32)
@@ -184,7 +183,7 @@ class Chat:
             tic = time.perf_counter()-tic
             num = result.size
             tps = num/tic
-            print(f'{'\n\n---\n\n'.join(text)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
+            print(f'{self.tokenizer.batch_decode(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(text)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
         return text
     @staticmethod
     def pad_to_batch(input_ids):
@@ -194,21 +193,28 @@ class Chat:
         mask = mx.array([[0]*(max_length-len(sublist)) + [1]*len(sublist) for sublist in input_ids])
         return toks, pids, mask
 
-inputs = ['Guten Tag', 'How are you']
+# inputs = ['Guten Tag', 'How are you']
+inputs = "What's the weather right now in LA?"
 
 chat = Chat()
 chat(inputs)
 
-# <|start_header_id|>assistant<|end_header_id|>
-
-# Guten Tag! Wie kann ich Ihnen helfen?<|eot_id|>!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# ["<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 25 Oct 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather right now in LA?<|eot_id|>"]
 
 # ---
 
 # <|start_header_id|>assistant<|end_header_id|>
 
-# I'm just a language model, I don't have feelings or emotions, but I'm functioning properly and ready to help with any questions or tasks you have. How can I assist you today?<|eot_id|>
+# I'm not capable of providing real-time weather information. However, I can suggest some ways for you to find out the current weather in Los Angeles.
+
+# You can check the weather forecast for Los Angeles by:
+
+# 1. Visiting a weather website, such as weather.com or accuweather.com, which provide up-to-date weather forecasts and conditions for various locations, including Los Angeles.
+# 2. Using a mobile app, such as Dark Sky or Weather Underground, which offer real-time weather information and forecasts for specific locations.
+# 3. Telling a voice assistant, such as Siri, Google Assistant, or Alexa, which can provide you with the current weather conditions in Los Angeles.
+
+# Please note that I'm an AI, and my knowledge cutoff is December 2023. I may not have the most up-to-date information on current weather conditions.<|eot_id|>
 
 # ---
 
-# 76.60 tps (88 in 1.15 seconds)
+# 58.59 tps (172 in 2.94 seconds)
