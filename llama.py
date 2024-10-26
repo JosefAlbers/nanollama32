@@ -1,11 +1,25 @@
+import base64
 import json
 import time
-import base64
+from datetime import datetime
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
 import tiktoken
+from huggingface_hub import snapshot_download
+
+CHAT_INIT = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: {date}
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{text}<|eot_id|>"""
+
+CHAT_CONT = """<|start_header_id|>user<|end_header_id|>
+
+{text}<|eot_id|>"""
 
 class Tokenizer:
     def __init__(self, path_tok):
@@ -24,15 +38,6 @@ class Tokenizer:
             lol = [lol]
         return [self.encoding.decode(l) for l in lol]
 
-CHAT = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-Cutting Knowledge Date: December 2023
-Today Date: 25 Oct 2024
-
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-{text}<|eot_id|>"""
-
 class RoPE:
     def __init__(self, cfg):
         dim, base, factor, low, high, omax = cfg['head_dim'], cfg['rope_theta'], cfg['rope_scaling']['factor'], cfg['rope_scaling']['low_freq_factor'], cfg['rope_scaling']['high_freq_factor'], cfg['rope_scaling']['original_max_position_embeddings']
@@ -45,19 +50,9 @@ class RoPE:
         freqs = np.where((low_len < wavelens) & (wavelens < high_len), between, freqs)
         self._inv_freq = mx.array(1 / freqs)
     def __call__(self, pids):
-        freqs = (pids[:, None, :, None] @ mx.repeat(self._inv_freq[None, None, None, :], pids.shape[0], axis=0))
+        freqs = pids[:, None, :, None] @ mx.repeat(self._inv_freq[None, None, None, :], pids.shape[0], axis=0)
         emb = mx.concatenate((freqs, freqs), axis=-1)
-        cos = mx.cos(emb)
-        sin = mx.sin(emb)
-        return cos, sin
-
-@mx.compile
-def apply_rope(q, k, cos, sin):
-    q1, q2 = mx.split(q, 2, axis=-1)
-    rq = mx.concatenate([-q2, q1], axis = -1)
-    k1, k2 = mx.split(k, 2, axis=-1)
-    rk = mx.concatenate([-k2, k1], axis = -1)
-    return (q * cos + rq * sin), (k * cos + rk * sin)
+        return mx.cos(emb), mx.sin(emb)
 
 class Attention(nn.Module):
     def __init__(self, cfg):
@@ -83,7 +78,7 @@ class Attention(nn.Module):
         q = q.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         k = k.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        q, k = apply_rope(q, k, *rope)
+        q, k = self.apply_rope(q, k, *rope)
         if cache is not None:
             k = mx.concatenate([cache[0], k], axis=2)
             v = mx.concatenate([cache[1], v], axis=2)
@@ -93,6 +88,14 @@ class Attention(nn.Module):
         o = w @ mx.repeat(v, self.n_repeat, axis=1)
         o = o.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(o).astype(dtype), (k,v)
+    @staticmethod
+    @mx.compile
+    def apply_rope(q, k, cos, sin):
+        q1, q2 = mx.split(q, 2, axis=-1)
+        rq = mx.concatenate([-q2, q1], axis = -1)
+        k1, k2 = mx.split(k, 2, axis=-1)
+        rk = mx.concatenate([-k2, k1], axis = -1)
+        return (q * cos + rq * sin), (k * cos + rk * sin)
 
 class MLP(nn.Module):
     def __init__(self, cfg):
@@ -136,26 +139,15 @@ class Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.model = LlamaModel(cfg)
-        self.num_layers = cfg['num_hidden_layers']
         self._rope = RoPE(cfg)
         if cfg['tie_word_embeddings']:
             self.tie = True
         else:
             self.tie = False
             self.lm_head = nn.Linear(cfg['hidden_size'], cfg['vocab_size'], bias=False)
-    def __call__(self, toks, pids, mask, cache=None):
-        if cache is None:
-            cache = [None] * self.num_layers
-            offset = 0
-        else:
-            offset = cache[0][0].shape[-2]
-        len_in = toks.shape[-1]
-        _mask = mx.triu(mx.full((offset+len_in, offset+len_in), -mx.inf), k=1)
-        if mask is not None:
-            _mask += mx.where(mask[:, None, :, None]*mask[:, None, None, :]==1, 0, -mx.inf)
-        _mask = _mask[...,-len_in:,:]
+    def __call__(self, toks, pids, mask, cache):
         rope = self._rope(pids)
-        out, cache = self.model(toks=toks, rope=rope, mask=_mask, cache=cache)
+        out, cache = self.model(toks=toks, rope=rope, mask=mask, cache=cache)
         if self.tie:
             return self.model.embed_tokens.as_linear(out), cache
         return self.lm_head(out), cache
@@ -169,31 +161,40 @@ class Chat:
         with open(f'{path_hf}/llama_32_1b_it_config.json', 'r') as f:
             cfg = json.load(f)
         model = Model(cfg)
-        model.load_weights(f'{path_hf}/llama_32_1b_it_model.safetensors', strict=False)
+        model.load_weights(f'{path_hf}/llama_32_1b_it_model.safetensors', strict=True)
         model.eval()
         mx.eval(model)
         self.model = model
         self.tokenizer = Tokenizer(f'{path_hf}/llama_32_1b_it.tiktoken')
+        self.num_layers = cfg['num_hidden_layers']
+        self.cache = None
+        self.mask = None
+        self.pids = 0
     def __call__(self, inputs, max_new=500, verbose=True):
         tic = time.perf_counter()
         if isinstance(inputs, str):
             inputs = [inputs]
         assert len(inputs) == 1, 'Batching is not implemented yet'
-        inputs = self.tokenizer.encode([CHAT.format(text=i) for i in inputs])
+        chat_fmt = CHAT_INIT if self.cache is None else CHAT_CONT
+        chat_fmt = chat_fmt.format(date=datetime.now().strftime('%d %b %Y'), text='{text}')
+        inputs = self.tokenizer.encode([chat_fmt.format(text=i) for i in inputs])
         toks, pids, mask = self.pad_to_batch(inputs)
-        cache = None
+        cache = [None] * self.num_layers if self.cache is None else self.cache
         result = mx.zeros((toks.shape[0],0), dtype=mx.uint32)
         goon = mx.ones((toks.shape[0],1), dtype=mx.bool_)
         for _ in range(max_new):
-            toks, cache = self.model(toks=toks, pids=pids, mask=mask, cache=cache)
+            toks, cache = self.model(toks=toks, pids=pids, mask=self.get_mask(mask, toks.shape[-1]), cache=cache)
             toks = mx.argmax(toks[:,-1,:], axis=-1, keepdims=True)
             pids = pids[:,-1:]+1
-            mask = mx.pad(mask, ((0,0), (0, 1)), constant_values=1)
-            mx.eval(toks, pids, mask)
-            result = mx.concatenate([result, toks*goon], axis=-1)
+            mx.eval(toks, pids, mask, cache)
+            result = mx.concatenate([result, toks], axis=-1)
             goon *= (toks != 128009) # <|eot_id|>
             if goon.sum() < 1:
                 break
+            mask = mx.pad(mask, ((0,0), (0, 1)), constant_values=1)
+        self.cache = cache
+        self.mask = mask
+        self.pids = pids
         text = self.tokenizer.decode(result.tolist())
         if verbose:
             tic = time.perf_counter()-tic
@@ -201,35 +202,105 @@ class Chat:
             tps = num/tic
             print(f'{self.tokenizer.decode(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(text)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
         return text
-    @staticmethod
-    def pad_to_batch(input_ids):
+    def pad_to_batch(self, input_ids):
         max_length = max(len(sublist) for sublist in input_ids)
-        toks = mx.array([[0]*(max_length-len(sublist)) + sublist for sublist in input_ids])
+        toks = mx.array([[128009]*(max_length-len(sublist)) + sublist for sublist in input_ids])
         pids = mx.array([[1]*(max_length-len(sublist)) + list(range(len(sublist))) for sublist in input_ids])
-        mask = mx.array([[0]*(max_length-len(sublist)) + [1]*len(sublist) for sublist in input_ids])
+        mask = mx.array([[False]*(max_length-len(sublist)) + [True]*len(sublist) for sublist in input_ids])
+        if self.cache is not None:
+            pids += self.pids
+            mask = mx.concatenate([self.mask, mask], axis=-1)
         return toks, pids, mask
-
+    @staticmethod
+    @mx.compile
+    def get_mask(mask, trunc):
+        _mask = mx.triu(mx.full((mask.shape[-1], mask.shape[-1]), False), k=1)
+        _mask *= mx.where(mask[:, None, :, None]*mask[:, None, None, :], 0, -mx.inf)
+        _mask = _mask[...,-trunc:,:]
+        return _mask
 chat = Chat()
-chat("What's the weather right now in Busan?")
+chat("What's the weather like in Busan?")
+chat("What's it like right now?")
+chat("Temperature")
 
-# ["<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 25 Oct 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather right now in Busan?<|eot_id|>"]
+# ["<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 25 Oct 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather like in Busan?<|eot_id|>"]
 
 # ---
 
 # <|start_header_id|>assistant<|end_header_id|>
 
-# However, I'm a large language model, I don't have real-time access to current weather conditions. But I can suggest some ways for you to find out the current weather in Busan.
+# In Busan, South Korea, the weather is typically warm and humid throughout the year. Here's a breakdown of the typical weather conditions:
 
-# You can:
+# * Summer (June to August): Hot and humid, with average high temperatures ranging from 28°C (82°F) to 32°C (90°F). Overnight temperatures can still be quite warm, around 22°C (72°F) to 25°C (77°F).
+# * Autumn (September to November): Mild and pleasant, with average high temperatures ranging from 20°C (68°F) to 25°C (77°F). Overnight temperatures can still be quite comfortable, around 15°C (59°F) to 20°C (68°F).
+# * Winter (December to February): Cool and wet, with average high temperatures ranging from 10°C (50°F) to 15°C (59°F). Overnight temperatures can drop significantly, around 5°C (41°F) to 10°C (50°F).
+# * Spring (March to May): Mild and pleasant, with average high temperatures ranging from 15°C (59°F) to 20°C (68°F). Overnight temperatures can still be quite comfortable, around 10°C (50°F) to 15°C (59°F).
 
-# 1. Check online weather websites or apps, such as AccuWeather, Weather.com, or the Korea Meteorological Administration (KMA) website.
-# 2. Use a mobile app like Dark Sky or Weather Underground, which provide current weather conditions and forecasts for Busan.
-# 3. Tune into local news or radio stations, which often provide weather updates.
+# It's worth noting that Busan can experience occasional extreme weather conditions, such as typhoons, heatwaves, and cold snaps. It's always a good idea to check the weather forecast before traveling to Busan.
 
-# Please note that the weather can change rapidly, so it's always a good idea to check multiple sources for the most up-to-date information.
+# In addition to the general weather patterns, Busan can also experience:
 
-# If you'd like, I can also provide you with general information about the climate and weather patterns in Busan.<|eot_id|>
+# * Humidity: High humidity is common in Busan, especially during the summer months.
+# * Rainfall: Busan can experience heavy rainfall, especially during the summer months.
+# * Thunderstorms: Thunderstorms are common in Busan, especially during the summer months.
+# * Fog: Fog can occur in Busan, especially in the mornings and evenings.
+
+# Overall, Busan's weather is characterized by warm and humid conditions throughout the year, with occasional extreme weather conditions.<|eot_id|>
 
 # ---
 
-# 65.66 tps (168 in 2.56 seconds)
+# 65.76 tps (406 in 6.17 seconds)
+# ["<|start_header_id|>user<|end_header_id|>\n\nWhat's it like right now?<|eot_id|>"]
+
+# ---
+
+# <|start_header_id|>assistant<|end_header_id|>
+
+# I don't have real-time access to current weather conditions. However, I can suggest some ways for you to find out the current weather in Busan, South Korea.
+
+# 1. Check online weather websites: You can check websites like AccuWeather, Weather.com, or the Korea Meteorological Administration (KMA) for the current weather conditions in Busan.
+# 2. Use a mobile app: You can download mobile apps like Dark Sky, Weather Underground, or The Weather Channel to get the current weather conditions in Busan.
+# 3. Check social media: You can check social media platforms like Twitter or Facebook for updates on the current weather in Busan.
+
+# Please note that the weather in Busan can change quickly, so it's always a good idea to check multiple sources for the most up-to-date information.
+
+# If you're looking for a specific type of weather, such as a specific temperature or precipitation, I can try to help you with that. Just let me know what you're looking for, and I'll do my best to provide you with the information you need.<|eot_id|>
+
+# ---
+
+# 61.13 tps (220 in 3.60 seconds)
+# ['<|start_header_id|>user<|end_header_id|>\n\nTemperature<|eot_id|>']
+
+# ---
+
+# <|start_header_id|>assistant<|end_header_id|>
+
+# I can provide you with general information about the temperature in Busan, South Korea.
+
+# As I mentioned earlier, Busan has a humid subtropical climate, with warm and humid summers, mild and pleasant winters, and a moderate climate throughout the year.
+
+# **Summer (June to August)**
+
+# * Average high temperature: 28°C (82°F)
+# * Average low temperature: 22°C (72°F)
+
+# **Autumn (September to November)**
+
+# * Average high temperature: 20°C (68°F)
+# * Average low temperature: 15°C (59°F)
+
+# **Winter (December to February)**
+
+# * Average high temperature: 10°C (50°F)
+# * Average low temperature: 5°C (41°F)
+
+# **Spring (March to May)**
+
+# * Average high temperature: 15°C (59°F)
+# * Average low temperature: 10°C (50°F)
+
+# Please note that these are general temperature ranges, and actual temperatures can vary from year to year.<|eot_id|>
+
+# ---
+
+# 58.44 tps (203 in 3.47 seconds)

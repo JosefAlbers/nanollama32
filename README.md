@@ -1,5 +1,3 @@
-
-
 # nanollama32
 
 A compact and efficient implementation of the Llama 3.2 in a single file, featuring minimal dependencies—**no transformers library required, even for tokenization**.
@@ -27,11 +25,22 @@ pip install -r requirements.txt
 Here’s a quick example of how to use `nanollama32`:
 
 ```python
-from nanollama32 import Chat
+>>> from nanollama32 import Chat
 
-chat = Chat()
-response = chat("What's the weather like in Busan?")
-print(response)
+# Initialize the chat instance
+>>> chat = Chat()
+
+# Start a conversation
+>>> chat("What's the weather like in Busan?")
+# Llama responds with information about the weather
+
+# Follow-up question that builds on the previous context
+>>> chat("And how about the temperature?")
+# Llama responds with the temperature, remembering the previous context
+
+# Another follow-up, further utilizing context
+>>> chat("What should I wear?")
+# Llama suggests clothing based on the previous responses
 ```
 
 ## License
