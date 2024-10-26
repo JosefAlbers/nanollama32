@@ -1,5 +1,8 @@
+import argparse
 import base64
 import json
+import os
+import re
 import time
 from datetime import datetime
 import mlx.core as mx
@@ -17,7 +20,7 @@ Today Date: {date}
 
 {text}<|eot_id|>"""
 
-CHAT_CONT = """<|start_header_id|>user<|end_header_id|>
+CHAT_CONT = """<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 {text}<|eot_id|>"""
 
@@ -49,10 +52,11 @@ class RoPE:
         between = freqs / ((1 - between) / factor + between)
         freqs = np.where((low_len < wavelens) & (wavelens < high_len), between, freqs)
         self._inv_freq = mx.array(1 / freqs)
+        self.dtype = eval(f'mx.{cfg['torch_dtype']}')
     def __call__(self, pids):
         freqs = pids[:, None, :, None] @ mx.repeat(self._inv_freq[None, None, None, :], pids.shape[0], axis=0)
         emb = mx.concatenate((freqs, freqs), axis=-1)
-        return mx.cos(emb), mx.sin(emb)
+        return mx.cos(emb).astype(self.dtype), mx.sin(emb).astype(self.dtype)
 
 class Attention(nn.Module):
     def __init__(self, cfg):
@@ -71,6 +75,7 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
+        self.dtype = eval(f'mx.{cfg['torch_dtype']}')
     def __call__(self, x, rope, mask, cache):
         B, L, D = x.shape
         dtype = x.dtype
@@ -88,14 +93,12 @@ class Attention(nn.Module):
         o = w @ mx.repeat(v, self.n_repeat, axis=1)
         o = o.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(o).astype(dtype), (k,v)
-    @staticmethod
-    @mx.compile
-    def apply_rope(q, k, cos, sin):
+    def apply_rope(self, q, k, cos, sin):
         q1, q2 = mx.split(q, 2, axis=-1)
         rq = mx.concatenate([-q2, q1], axis = -1)
         k1, k2 = mx.split(k, 2, axis=-1)
         rk = mx.concatenate([-k2, k1], axis = -1)
-        return (q * cos + rq * sin), (k * cos + rk * sin)
+        return (q * cos + rq * sin).astype(self.dtype), (k * cos + rk * sin).astype(self.dtype)
 
 class MLP(nn.Module):
     def __init__(self, cfg):
@@ -164,44 +167,49 @@ class Chat:
         model.load_weights(f'{path_hf}/llama_32_1b_it_model.safetensors', strict=True)
         model.eval()
         mx.eval(model)
+        self.dtype = eval(f'mx.{cfg['torch_dtype']}')
         self.model = model
         self.tokenizer = Tokenizer(f'{path_hf}/llama_32_1b_it.tiktoken')
         self.num_layers = cfg['num_hidden_layers']
         self.cache = None
         self.mask = None
         self.pids = 0
-    def __call__(self, inputs, max_new=500, verbose=True):
+        self.hx = []
+    def __call__(self, inputs, max_new=500, chat_fmt=True, verbose=True):
         tic = time.perf_counter()
         if isinstance(inputs, str):
             inputs = [inputs]
         assert len(inputs) == 1, 'Batching is not implemented yet'
-        chat_fmt = CHAT_INIT if self.cache is None else CHAT_CONT
-        chat_fmt = chat_fmt.format(date=datetime.now().strftime('%d %b %Y'), text='{text}')
-        inputs = self.tokenizer.encode([chat_fmt.format(text=i) for i in inputs])
-        toks, pids, mask = self.pad_to_batch(inputs)
+        if chat_fmt:
+            chat_fmt = CHAT_INIT if self.cache is None else CHAT_CONT
+            chat_fmt = chat_fmt.format(date=datetime.now().strftime('%d %b %Y'), text='{text}')
+            inputs = [chat_fmt.format(text=i) for i in inputs]
+        toks = self.tokenizer.encode(inputs)
+        toks, pids, mask = self.pad_to_batch(toks)
         cache = [None] * self.num_layers if self.cache is None else self.cache
         result = mx.zeros((toks.shape[0],0), dtype=mx.uint32)
         goon = mx.ones((toks.shape[0],1), dtype=mx.bool_)
         for _ in range(max_new):
             toks, cache = self.model(toks=toks, pids=pids, mask=self.get_mask(mask, toks.shape[-1]), cache=cache)
             toks = mx.argmax(toks[:,-1,:], axis=-1, keepdims=True)
-            pids = pids[:,-1:]+1
-            mx.eval(toks, pids, mask, cache)
+            mx.eval(toks, cache)
             result = mx.concatenate([result, toks], axis=-1)
-            goon *= (toks != 128009) # <|eot_id|>
+            pids = pids[:,-1:]+1
+            goon *= (toks != 128009)
+            mask = mx.pad(mask, ((0,0), (0, 1)), constant_values=1)
             if goon.sum() < 1:
                 break
-            mask = mx.pad(mask, ((0,0), (0, 1)), constant_values=1)
         self.cache = cache
-        self.mask = mask
+        self.mask = mask[:,:-1]
         self.pids = pids
-        text = self.tokenizer.decode(result.tolist())
+        outputs = self.tokenizer.decode(result.tolist())
         if verbose:
             tic = time.perf_counter()-tic
             num = result.size
             tps = num/tic
-            print(f'{self.tokenizer.decode(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(text)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
-        return text
+            print(f'{'\n\n---\n\n'.join(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(outputs)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
+        self.hx += inputs + outputs
+        return outputs
     def pad_to_batch(self, input_ids):
         max_length = max(len(sublist) for sublist in input_ids)
         toks = mx.array([[128009]*(max_length-len(sublist)) + sublist for sublist in input_ids])
@@ -211,96 +219,58 @@ class Chat:
             pids += self.pids
             mask = mx.concatenate([self.mask, mask], axis=-1)
         return toks, pids, mask
-    @staticmethod
-    @mx.compile
-    def get_mask(mask, trunc):
-        _mask = mx.triu(mx.full((mask.shape[-1], mask.shape[-1]), False), k=1)
-        _mask *= mx.where(mask[:, None, :, None]*mask[:, None, None, :], 0, -mx.inf)
+    def get_mask(self, mask, trunc):
+        _mask = mx.triu(mx.full((mask.shape[-1], mask.shape[-1]), -mx.inf), k=1)
+        _mask += mx.where(mask[:, None, :, None]*mask[:, None, None, :], 0, -mx.inf)
         _mask = _mask[...,-trunc:,:]
-        return _mask
-chat = Chat()
-chat("What's the weather like in Busan?")
-chat("What's it like right now?")
-chat("Temperature")
+        return _mask.astype(self.dtype)
 
-# ["<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 25 Oct 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat's the weather like in Busan?<|eot_id|>"]
+def add_text(input_string):
+    def get_text(match):
+        filename = match.group(1)
+        try:
+            with open(filename, 'r') as file:
+                return file.read().strip()
+        except FileNotFoundError:
+            return f"Error: {filename} not found."
+        except Exception as e:
+            return f"An error occurred: {e}"
+    output_string = re.sub(r'\{([^}]+)\}', get_text, input_string)
+    return output_string
 
-# ---
+def main():
+    chat = Chat()
+    parser = argparse.ArgumentParser(description='jj')
+    parser.add_argument('input', type=str, nargs='*')
+    parser.add_argument('--history', type=str, default='history.json')
+    parser.add_argument('--resume', type=int, default=-1)
+    parser.add_argument('--max', type=int, default=500)
+    args = parser.parse_args()
+    user_input = ' '.join(args.input)
+    if len(user_input) < 1:
+        user_input = input('# ')
+    user_input = add_text(user_input)
+    history=args.history
+    chat_fmt = True
+    if os.path.exists(history):
+        with open(history, 'r') as f:
+            hx = json.load(f)
+        if args.resume >= 0:
+            idx_ctx = sorted(hx, key=int, reverse=True)[0] if args.resume == 0 else str(args.resume)
+            user_input = hx[idx_ctx] + CHAT_CONT[10:].format(text=user_input)
+            chat_fmt = False
+    else:
+        hx = {}
+    print(f'# {user_input}')
+    while len(user_input) > 1:
+        llm_output = chat(user_input, verbose=False, chat_fmt=chat_fmt, max_new=args.max)[0][45:-10].strip()
+        print(f'\033[34m{llm_output}\033[0m')
+        user_input = input('# ')
+        user_input = add_text(user_input)
+        chat_fmt = True
+    hx[datetime.now().strftime('%Y%m%d%H%M%S')] = ''.join(chat.hx)
+    with open(history, "w") as f:
+        json.dump(hx, f, indent=4)
 
-# <|start_header_id|>assistant<|end_header_id|>
-
-# In Busan, South Korea, the weather is typically warm and humid throughout the year. Here's a breakdown of the typical weather conditions:
-
-# * Summer (June to August): Hot and humid, with average high temperatures ranging from 28°C (82°F) to 32°C (90°F). Overnight temperatures can still be quite warm, around 22°C (72°F) to 25°C (77°F).
-# * Autumn (September to November): Mild and pleasant, with average high temperatures ranging from 20°C (68°F) to 25°C (77°F). Overnight temperatures can still be quite comfortable, around 15°C (59°F) to 20°C (68°F).
-# * Winter (December to February): Cool and wet, with average high temperatures ranging from 10°C (50°F) to 15°C (59°F). Overnight temperatures can drop significantly, around 5°C (41°F) to 10°C (50°F).
-# * Spring (March to May): Mild and pleasant, with average high temperatures ranging from 15°C (59°F) to 20°C (68°F). Overnight temperatures can still be quite comfortable, around 10°C (50°F) to 15°C (59°F).
-
-# It's worth noting that Busan can experience occasional extreme weather conditions, such as typhoons, heatwaves, and cold snaps. It's always a good idea to check the weather forecast before traveling to Busan.
-
-# In addition to the general weather patterns, Busan can also experience:
-
-# * Humidity: High humidity is common in Busan, especially during the summer months.
-# * Rainfall: Busan can experience heavy rainfall, especially during the summer months.
-# * Thunderstorms: Thunderstorms are common in Busan, especially during the summer months.
-# * Fog: Fog can occur in Busan, especially in the mornings and evenings.
-
-# Overall, Busan's weather is characterized by warm and humid conditions throughout the year, with occasional extreme weather conditions.<|eot_id|>
-
-# ---
-
-# 65.76 tps (406 in 6.17 seconds)
-# ["<|start_header_id|>user<|end_header_id|>\n\nWhat's it like right now?<|eot_id|>"]
-
-# ---
-
-# <|start_header_id|>assistant<|end_header_id|>
-
-# I don't have real-time access to current weather conditions. However, I can suggest some ways for you to find out the current weather in Busan, South Korea.
-
-# 1. Check online weather websites: You can check websites like AccuWeather, Weather.com, or the Korea Meteorological Administration (KMA) for the current weather conditions in Busan.
-# 2. Use a mobile app: You can download mobile apps like Dark Sky, Weather Underground, or The Weather Channel to get the current weather conditions in Busan.
-# 3. Check social media: You can check social media platforms like Twitter or Facebook for updates on the current weather in Busan.
-
-# Please note that the weather in Busan can change quickly, so it's always a good idea to check multiple sources for the most up-to-date information.
-
-# If you're looking for a specific type of weather, such as a specific temperature or precipitation, I can try to help you with that. Just let me know what you're looking for, and I'll do my best to provide you with the information you need.<|eot_id|>
-
-# ---
-
-# 61.13 tps (220 in 3.60 seconds)
-# ['<|start_header_id|>user<|end_header_id|>\n\nTemperature<|eot_id|>']
-
-# ---
-
-# <|start_header_id|>assistant<|end_header_id|>
-
-# I can provide you with general information about the temperature in Busan, South Korea.
-
-# As I mentioned earlier, Busan has a humid subtropical climate, with warm and humid summers, mild and pleasant winters, and a moderate climate throughout the year.
-
-# **Summer (June to August)**
-
-# * Average high temperature: 28°C (82°F)
-# * Average low temperature: 22°C (72°F)
-
-# **Autumn (September to November)**
-
-# * Average high temperature: 20°C (68°F)
-# * Average low temperature: 15°C (59°F)
-
-# **Winter (December to February)**
-
-# * Average high temperature: 10°C (50°F)
-# * Average low temperature: 5°C (41°F)
-
-# **Spring (March to May)**
-
-# * Average high temperature: 15°C (59°F)
-# * Average low temperature: 10°C (50°F)
-
-# Please note that these are general temperature ranges, and actual temperatures can vary from year to year.<|eot_id|>
-
-# ---
-
-# 58.44 tps (203 in 3.47 seconds)
+if __name__ == '__main__':
+    main()

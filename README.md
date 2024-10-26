@@ -10,17 +10,13 @@ A compact and efficient implementation of the Llama 3.2 in a single file, featur
 - Easy-to-use interface
 - Efficient performance suitable for various applications
 
-## Installation
+## Quick Start
 
 To get started, clone this repository and install the necessary packages. 
 
-```bash
-git clone https://github.com/JosefAlbers/nanollama32.git
-cd nanollama32
-pip install -r requirements.txt
+```zsh
+pip install nanollama
 ```
-
-## Usage
 
 Here’s a quick example of how to use `nanollama32`:
 
@@ -41,6 +37,40 @@ Here’s a quick example of how to use `nanollama32`:
 # Another follow-up, further utilizing context
 >>> chat("What should I wear?")
 # Llama suggests clothing based on the previous responses
+```
+
+## Command-Line Interface
+
+You can also run `nanollama32` from the command line:
+
+```zsh
+nlm how to create a new conda env
+# Llama responds with ways to create a new conda environment and prompts the user for further follow-up questions
+```
+
+### Managing Chat History
+
+- **--history**: Specify the path to the JSON file where chat history will be saved and/or loaded from. If the file does not exist, a new one will be created.
+- **--resume**: Use this option to resume the conversation from a specific point in the chat history.
+
+For example, to resume from a specific entry in history:
+
+```zsh
+nlm "and to delete env?" --resume 20241026053144
+```
+
+You can also specify `0` to resume from the most recent entry:
+
+```zsh
+nlm "and to list envs?" --resume 0
+```
+
+### Adding Text from Files
+
+You can include text from any number of external files by using the `{...}` syntax in your input. For example, if you have a text file named `langref.rst`, you can include its content in your input like this:
+
+```zsh
+nlm to create reddit bots {langref.rst}
 ```
 
 ## License
