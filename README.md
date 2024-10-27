@@ -53,16 +53,16 @@ nlm how to create a new conda env
 - **--history**: Specify the path to the JSON file where chat history will be saved and/or loaded from. If the file does not exist, a new one will be created.
 - **--resume**: Use this option to resume the conversation from a specific point in the chat history.
 
-For example, to resume from a specific entry in history:
-
-```zsh
-nlm "and to delete env?" --resume 20241026053144
-```
-
-You can also specify `0` to resume from the most recent entry:
+For example, you can specify `0` to resume from the most recent entry:
 
 ```zsh
 nlm "and to list envs?" --resume 0
+```
+
+Or, you can resume from a specific entry in history:
+
+```zsh
+nlm "and to delete env?" --resume 20241026053144
 ```
 
 ### Adding Text from Files

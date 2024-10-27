@@ -159,17 +159,17 @@ class Model(nn.Module):
         return self.model.layers
 
 class Chat:
-    def __init__(self):
-        path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=["llama_32_1b_it*"])
-        with open(f'{path_hf}/llama_32_1b_it_config.json', 'r') as f:
+    def __init__(self, variant='llama_32_1b_it'):
+        path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=[f'{variant}*'])
+        with open(f'{path_hf}/{variant}_config.json', 'r') as f:
             cfg = json.load(f)
         model = Model(cfg)
-        model.load_weights(f'{path_hf}/llama_32_1b_it_model.safetensors', strict=True)
+        model.load_weights(f'{path_hf}/{variant}_model.safetensors', strict=False)
         model.eval()
         mx.eval(model)
         self.dtype = eval(f'mx.{cfg['torch_dtype']}')
         self.model = model
-        self.tokenizer = Tokenizer(f'{path_hf}/llama_32_1b_it.tiktoken')
+        self.tokenizer = Tokenizer(f'{path_hf}/{variant}.tiktoken')
         self.num_layers = cfg['num_hidden_layers']
         self.cache = None
         self.mask = None
@@ -239,13 +239,14 @@ def add_text(input_string):
     return output_string
 
 def main():
-    chat = Chat()
     parser = argparse.ArgumentParser(description='jj')
     parser.add_argument('input', type=str, nargs='*')
+    parser.add_argument('--variant', type=str, default='llama_32_1b_it')
     parser.add_argument('--history', type=str, default='history.json')
     parser.add_argument('--resume', type=int, default=-1)
     parser.add_argument('--max', type=int, default=500)
     args = parser.parse_args()
+    chat = Chat(variant=args.variant)
     user_input = ' '.join(args.input)
     if len(user_input) < 1:
         user_input = input('# ')
