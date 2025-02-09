@@ -10,19 +10,27 @@ import mlx.nn as nn
 import numpy as np
 import tiktoken
 from huggingface_hub import snapshot_download
+from string import Template
 
 CHAT_INIT = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Cutting Knowledge Date: December 2023
-Today Date: {date}
+Today Date: $date
 
-<|eot_id|><|start_header_id|>user<|end_header_id|>
+$system<|eot_id|><|start_header_id|>user<|end_header_id|>
 
-{text}<|eot_id|>"""
+$text<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
 
 CHAT_CONT = """<|eot_id|><|start_header_id|>user<|end_header_id|>
 
-{text}<|eot_id|>"""
+$text<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+
+def subs(tmp, **kwargs):
+    return Template(tmp).safe_substitute(**kwargs)
 
 class Tokenizer:
     def __init__(self, path_tok):
@@ -159,7 +167,7 @@ class Model(nn.Module):
         return self.model.layers
 
 class Chat:
-    def __init__(self, variant='llama_32_1b_it'):
+    def __init__(self, variant='llama_32_1b_it', system='', c=34):
         path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=[f'{variant}*'])
         with open(f'{path_hf}/{variant}_config.json', 'r') as f:
             cfg = json.load(f)
@@ -171,25 +179,42 @@ class Chat:
         self.model = model
         self.tokenizer = Tokenizer(f'{path_hf}/{variant}.tiktoken')
         self.num_layers = cfg['num_hidden_layers']
+        self.c = c
+        self.reset(system=system)
+    def reset(self, system=''):
+        self.system = system
+        self.toks = None
         self.cache = None
         self.mask = None
         self.pids = 0
         self.hx = []
-    def __call__(self, inputs, max_new=500, chat_fmt=True, verbose=True):
-        tic = time.perf_counter()
+    def __call__(self, inputs, max_new=500, chat_fmt=True, verbose=False, stream=None):
         if isinstance(inputs, str):
             inputs = [inputs]
         assert len(inputs) == 1, 'Batching is not implemented yet'
         if chat_fmt:
             chat_fmt = CHAT_INIT if self.cache is None else CHAT_CONT
-            chat_fmt = chat_fmt.format(date=datetime.now().strftime('%d %b %Y'), text='{text}')
-            inputs = [chat_fmt.format(text=i) for i in inputs]
+            # chat_fmt = chat_fmt.format(date=datetime.now().strftime('%d %b %Y'), system=self.system, text='{text}')
+            chat_fmt = subs(chat_fmt, date=datetime.now().strftime('%d %b %Y'), system=self.system)
+            inputs = [subs(chat_fmt, text=i) for i in inputs]
         toks = self.tokenizer.encode(inputs)
+        return self.generate(inputs, toks, max_new=max_new, verbose=verbose, stream=stream)
+    def resume(self, max_new=500, verbose=False, stream=None):
+        return self.generate([''], self.toks, max_new, verbose, stream)
+    def generate(self, inputs, toks, max_new, verbose, stream):
+        tic = time.perf_counter()
         toks, pids, mask = self.pad_to_batch(toks)
         cache = [None] * self.num_layers if self.cache is None else self.cache
         result = mx.zeros((toks.shape[0],0), dtype=mx.uint32)
         goon = mx.ones((toks.shape[0],1), dtype=mx.bool_)
-        for _ in range(max_new):
+        f = None
+        if isinstance(stream, str):
+            try:
+                f = open(stream, "a", encoding="utf-8")
+            except:
+                f = None
+        idx_sofar = 0
+        for i in range(max_new):
             toks, cache = self.model(toks=toks, pids=pids, mask=self.get_mask(mask, toks.shape[-1]), cache=cache)
             toks = mx.argmax(toks[:,-1,:], axis=-1, keepdims=True)
             mx.eval(toks, cache)
@@ -197,19 +222,40 @@ class Chat:
             pids = pids[:,-1:]+1
             goon *= (toks != 128009)
             mask = mx.pad(mask, ((0,0), (0, 1)), constant_values=1)
+            if stream and i % 10 == 2:
+                txt = self.tokenizer.decode(result.tolist())[0]
+                idx_split = txt.rfind(' ', idx_sofar)
+                if idx_split > 0:
+                    frag = txt[idx_sofar:idx_split]
+                    if f:
+                        f.write(frag)
+                        f.flush()
+                    else:
+                        print(frag, end='', flush=True)
+                    idx_sofar = idx_split
             if goon.sum() < 1:
                 break
+        outputs = self.tokenizer.decode(result.tolist())
+        if stream:
+            if f:
+                f.write(outputs[0][idx_sofar:])
+                f.flush()
+                f.close()
+            else:
+                print(outputs[0][idx_sofar:], end='', flush=True)
+                print()
+        self.toks = toks.tolist()
         self.cache = cache
         self.mask = mask[:,:-1]
         self.pids = pids
-        outputs = self.tokenizer.decode(result.tolist())
-        if verbose:
-            tic = time.perf_counter()-tic
-            num = result.size
-            tps = num/tic
-            print(f'{'\n\n---\n\n'.join(inputs)}\n\n---\n\n{'\n\n---\n\n'.join(outputs)}\n\n---\n\n{tps:.2f} tps ({num} in {tic:.2f} seconds)')
         self.hx += inputs + outputs
-        return outputs
+        tic = time.perf_counter()-tic
+        num = result.size
+        tps = num/tic
+        benchmark = f'{tps:.2f} tps ({num} in {tic:.2f} seconds)'
+        if verbose:
+            print(f'\033[{self.c-3}m{'\n\n---\n\n'.join(inputs)}\033[0m---\n\n\033[{self.c}m{'\n\n---\n\n'.join(outputs)}\033[0m\n\n---\n\n{benchmark}')
+        return outputs + [benchmark]
     def pad_to_batch(self, input_ids):
         max_length = max(len(sublist) for sublist in input_ids)
         toks = mx.array([[128009]*(max_length-len(sublist)) + sublist for sublist in input_ids])
@@ -241,12 +287,13 @@ def add_text(input_string):
 def main():
     parser = argparse.ArgumentParser(description='jj')
     parser.add_argument('input', type=str, nargs='*')
-    parser.add_argument('--variant', type=str, default='llama_32_1b_it')
-    parser.add_argument('--history', type=str, default='history.json')
-    parser.add_argument('--resume', type=int, default=-1)
-    parser.add_argument('--max', type=int, default=500)
+    parser.add_argument('-s', '--system', type=str, default='')
+    parser.add_argument('-v', '--variant', type=str, default='uncn_llama_32_3b_it')
+    parser.add_argument('-hx', '--history', type=str, default='history.json')
+    parser.add_argument('-r', '--resume', type=int, default=-1)
+    parser.add_argument('-m', '--max', type=int, default=5000)
     args = parser.parse_args()
-    chat = Chat(variant=args.variant)
+    chat = Chat(variant=args.variant, system=args.system)
     user_input = ' '.join(args.input)
     if len(user_input) < 1:
         user_input = input('# ')
@@ -258,13 +305,14 @@ def main():
             hx = json.load(f)
         if args.resume >= 0:
             idx_ctx = sorted(hx, key=int, reverse=True)[0] if args.resume == 0 else str(args.resume)
-            user_input = hx[idx_ctx] + CHAT_CONT[10:].format(text=user_input)
+            # user_input = hx[idx_ctx] + CHAT_CONT[10:].format(text=user_input)
+            user_input = hx[idx_ctx] + subs(CHAT_CONT[10:], text=user_input)
             chat_fmt = False
+            print(f'= {user_input}')
     else:
         hx = {}
-    print(f'# {user_input}')
     while len(user_input) > 1:
-        llm_output = chat(user_input, verbose=False, chat_fmt=chat_fmt, max_new=args.max)[0][45:-10].strip()
+        llm_output = chat(user_input, verbose=False, chat_fmt=chat_fmt, max_new=args.max)[0][:-10].strip()
         print(f'\033[34m{llm_output}\033[0m')
         user_input = input('# ')
         user_input = add_text(user_input)

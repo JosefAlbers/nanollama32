@@ -8,7 +8,7 @@ setup(
     url='https://github.com/JosefAlbers/nanollama32',
     py_modules=['nanollama32'],
     packages=find_packages(),
-    version='0.0.2',
+    version='0.0.3-beta',
     readme="README.md",
     author_email="albersj66@gmail.com",
     description="Nano Llama",
@@ -16,7 +16,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Josef Albers",
     license="MIT",
-    python_requires=">=3.12.3",
+    python_requires=">=3.12.8",
     install_requires=requirements,
     entry_points={
         "console_scripts": [
