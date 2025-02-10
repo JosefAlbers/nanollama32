@@ -204,6 +204,7 @@ class Chat:
     def generate(self, inputs, toks, max_new, verbose, stream):
         tic = time.perf_counter()
         toks, pids, mask = self.pad_to_batch(toks)
+        ntok_i = toks.size
         cache = [None] * self.num_layers if self.cache is None else self.cache
         result = mx.zeros((toks.shape[0],0), dtype=mx.uint32)
         goon = mx.ones((toks.shape[0],1), dtype=mx.bool_)
@@ -214,6 +215,7 @@ class Chat:
             except:
                 f = None
         idx_sofar = 0
+        stop = 'len'
         for i in range(max_new):
             toks, cache = self.model(toks=toks, pids=pids, mask=self.get_mask(mask, toks.shape[-1]), cache=cache)
             toks = mx.argmax(toks[:,-1,:], axis=-1, keepdims=True)
@@ -234,6 +236,7 @@ class Chat:
                         print(frag, end='', flush=True)
                     idx_sofar = idx_split
             if goon.sum() < 1:
+                stop='eot'
                 break
         outputs = self.tokenizer.decode(result.tolist())
         if stream:
@@ -249,13 +252,12 @@ class Chat:
         self.mask = mask[:,:-1]
         self.pids = pids
         self.hx += inputs + outputs
-        tic = time.perf_counter()-tic
-        num = result.size
-        tps = num/tic
-        benchmark = f'{tps:.2f} tps ({num} in {tic:.2f} seconds)'
+        ntok_o = result.size
+        benchmark = f'{ntok_i} input and {ntok_o} output tokens in {time.perf_counter()-tic:.2f} seconds'
         if verbose:
             print(f'\033[{self.c-3}m{'\n\n---\n\n'.join(inputs)}\033[0m---\n\n\033[{self.c}m{'\n\n---\n\n'.join(outputs)}\033[0m\n\n---\n\n{benchmark}')
-        return outputs + [benchmark]
+        text = outputs[0][:-10].strip() if stop == 'eot' else outputs[0].strip()
+        return dict(text=text, outputs=outputs, benchmark=benchmark, stop=stop)
     def pad_to_batch(self, input_ids):
         max_length = max(len(sublist) for sublist in input_ids)
         toks = mx.array([[128009]*(max_length-len(sublist)) + sublist for sublist in input_ids])
@@ -305,15 +307,14 @@ def main():
             hx = json.load(f)
         if args.resume >= 0:
             idx_ctx = sorted(hx, key=int, reverse=True)[0] if args.resume == 0 else str(args.resume)
-            # user_input = hx[idx_ctx] + CHAT_CONT[10:].format(text=user_input)
             user_input = hx[idx_ctx] + subs(CHAT_CONT[10:], text=user_input)
             chat_fmt = False
             print(f'= {user_input}')
     else:
         hx = {}
     while len(user_input) > 1:
-        llm_output = chat(user_input, verbose=False, chat_fmt=chat_fmt, max_new=args.max)[0][:-10].strip()
-        print(f'\033[34m{llm_output}\033[0m')
+        llm_output = chat(user_input, verbose=False, chat_fmt=chat_fmt, max_new=args.max)['text']
+        print(f'\033[34m{llm_output}\033[0m') #\n\n---\n\n{benchmark}')
         user_input = input('# ')
         user_input = add_text(user_input)
         chat_fmt = True
