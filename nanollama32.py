@@ -181,6 +181,8 @@ class Chat:
         self.num_layers = cfg['num_hidden_layers']
         self.c = c
         self.reset(system=system)
+    def get_ntok(self, s):
+        return len(self.tokenizer.encode(s)[0])
     def reset(self, system=''):
         self.system = system
         self.toks = None
