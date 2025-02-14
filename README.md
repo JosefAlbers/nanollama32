@@ -1,10 +1,10 @@
-# nanollama32
+# nanollama
 
 A compact and efficient implementation of the Llama 3.2 in a single file, featuring minimal dependencies—**no transformers library required, even for tokenization**.
 
 ## Overview
 
-`nanollama32` provides a lightweight and straightforward implementation of the Llama model. It features:
+`nanollama` provides a lightweight and straightforward implementation of the Llama model. It features:
 
 - Minimal dependencies
 - Easy-to-use interface
@@ -21,7 +21,7 @@ pip install nanollama
 Here’s a quick example of how to use `nanollama32`:
 
 ```python
->>> from nanollama32 import Chat
+>>> from nanollama import Chat
 
 # Initialize the chat instance
 >>> chat = Chat()
@@ -41,7 +41,7 @@ Here’s a quick example of how to use `nanollama32`:
 
 ## Command-Line Interface
 
-You can also run `nanollama32` from the command line:
+You can also run `nanollama` from the command line:
 
 ```zsh
 nlm how to create a new conda env

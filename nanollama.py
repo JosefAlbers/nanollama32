@@ -167,17 +167,17 @@ class Model(nn.Module):
         return self.model.layers
 
 class Chat:
-    def __init__(self, variant='llama_32_1b_it', system='', c=34):
-        path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=[f'{variant}*'])
-        with open(f'{path_hf}/{variant}_config.json', 'r') as f:
+    def __init__(self, model_path='llama_32_1b_it', system='', c=34, max_kv_size=None):
+        path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=[f'{model_path}*'])
+        with open(f'{path_hf}/{model_path}_config.json', 'r') as f:
             cfg = json.load(f)
         model = Model(cfg)
-        model.load_weights(f'{path_hf}/{variant}_model.safetensors', strict=False)
+        model.load_weights(f'{path_hf}/{model_path}_model.safetensors', strict=False)
         model.eval()
         mx.eval(model)
         self.dtype = eval(f'mx.{cfg['torch_dtype']}')
         self.model = model
-        self.tokenizer = Tokenizer(f'{path_hf}/{variant}.tiktoken')
+        self.tokenizer = Tokenizer(f'{path_hf}/{model_path}.tiktoken')
         self.num_layers = cfg['num_hidden_layers']
         self.c = c
         self.reset(system=system)
@@ -188,10 +188,13 @@ class Chat:
         self.toks = None
         self.cache = None
         self.mask = None
+        self.stop = None
         self.pids = 0
         self.hx = []
     def __call__(self, inputs, max_new=500, chat_fmt=True, verbose=False, stream=None):
         if isinstance(inputs, str):
+            if len(inputs) == 0:
+                return self.resume(max_new=max_new, verbose=verbose, stream=stream)
             inputs = [inputs]
         assert len(inputs) == 1, 'Batching is not implemented yet'
         if chat_fmt:
@@ -202,7 +205,9 @@ class Chat:
         toks = self.tokenizer.encode(inputs)
         return self.generate(inputs, toks, max_new=max_new, verbose=verbose, stream=stream)
     def resume(self, max_new=500, verbose=False, stream=None):
-        return self.generate([''], self.toks, max_new, verbose, stream)
+        if self.stop == 'len':
+            return self.generate([''], self.toks, max_new=max_new, verbose=verbose, stream=stream)
+        return dict(text='', outputs=[''], benchmark='n/a', stop=self.stop)
     def generate(self, inputs, toks, max_new, verbose, stream):
         tic = time.perf_counter()
         toks, pids, mask = self.pad_to_batch(toks)
@@ -238,9 +243,10 @@ class Chat:
                         print(frag, end='', flush=True)
                     idx_sofar = idx_split
             if goon.sum() < 1:
-                stop='eot'
+                stop='stop'
                 break
         outputs = self.tokenizer.decode(result.tolist())
+        self.stop = stop
         if stream:
             if f:
                 f.write(outputs[0][idx_sofar:])
@@ -258,7 +264,7 @@ class Chat:
         benchmark = f'{ntok_i} input and {ntok_o} output tokens in {time.perf_counter()-tic:.2f} seconds'
         if verbose:
             print(f'\033[{self.c-3}m{'\n\n---\n\n'.join(inputs)}\033[0m---\n\n\033[{self.c}m{'\n\n---\n\n'.join(outputs)}\033[0m\n\n---\n\n{benchmark}')
-        text = outputs[0][:-10].strip() if stop == 'eot' else outputs[0].strip()
+        text = outputs[0][:-10].strip() if stop == 'stop' else outputs[0].strip()
         return dict(text=text, outputs=outputs, benchmark=benchmark, stop=stop)
     def pad_to_batch(self, input_ids):
         max_length = max(len(sublist) for sublist in input_ids)
@@ -292,12 +298,15 @@ def main():
     parser = argparse.ArgumentParser(description='jj')
     parser.add_argument('input', type=str, nargs='*')
     parser.add_argument('-s', '--system', type=str, default='')
-    parser.add_argument('-v', '--variant', type=str, default='uncn_llama_32_3b_it')
+    parser.add_argument('-p', '--model_path', type=str, default='uncn_llama_32_3b_it')
     parser.add_argument('-hx', '--history', type=str, default='history.json')
     parser.add_argument('-r', '--resume', type=int, default=-1)
     parser.add_argument('-m', '--max', type=int, default=5000)
+    parser.add_argument('-t', '--test', action='store_true')
     args = parser.parse_args()
-    chat = Chat(variant=args.variant, system=args.system)
+    if args.test:
+        return test()
+    chat = Chat(model_path=args.model_path, system=args.system)
     user_input = ' '.join(args.input)
     if len(user_input) < 1:
         user_input = input('# ')
@@ -314,7 +323,7 @@ def main():
             print(f'= {user_input}')
     else:
         hx = {}
-    while len(user_input) > 1:
+    while user_input != 'q':
         llm_output = chat(user_input, verbose=False, chat_fmt=chat_fmt, max_new=args.max)['text']
         print(f'\033[34m{llm_output}\033[0m') #\n\n---\n\n{benchmark}')
         user_input = input('# ')
@@ -323,6 +332,7 @@ def main():
     hx[datetime.now().strftime('%Y%m%d%H%M%S')] = ''.join(chat.hx)
     with open(history, "w") as f:
         json.dump(hx, f, indent=4)
+
 
 if __name__ == '__main__':
     main()

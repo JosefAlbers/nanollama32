@@ -6,9 +6,9 @@ with open("requirements.txt") as f:
 setup(
     name='nanollama',
     url='https://github.com/JosefAlbers/nanollama32',
-    py_modules=['nanollama32'],
+    py_modules=['nanollama'],
     packages=find_packages(),
-    version='0.0.5-beta',
+    version='0.0.5',
     readme="README.md",
     author_email="albersj66@gmail.com",
     description="Nano Llama",
@@ -20,7 +20,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "nlm = nanollama32:main",
+            "nlm = nanollama:main",
         ],
     },
 )
