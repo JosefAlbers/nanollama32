@@ -1,3 +1,17 @@
+# Copyright 2025 Josef Albers
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import base64
 import json
@@ -11,6 +25,7 @@ import numpy as np
 import tiktoken
 from huggingface_hub import snapshot_download
 from string import Template
+import difflib
 
 CHAT_INIT = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -28,6 +43,20 @@ CHAT_CONT = """<|eot_id|><|start_header_id|>user<|end_header_id|>
 $text<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
+
+FIM_TEMPLATE = """Fill in the missing part of the following code to complete it. Only output the missing part, without explanations, comments, or code fences.
+
+Code until the missing part:
+```
+{prefix}
+```
+
+Code after the missing part:
+```
+{suffix}
+```
+
+Output only the code to complete it."""
 
 def subs(tmp, **kwargs):
     return Template(tmp).safe_substitute(**kwargs)
@@ -166,8 +195,29 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
+def find_added_lines(old_string, new_string):
+    diff = list(difflib.unified_diff(
+        old_string.rstrip().splitlines(keepends=False),
+        new_string.rstrip().splitlines(keepends=False),
+        n=0, 
+        lineterm=''
+    ))
+    diff = diff[2:]
+    added_lines = []
+    for line in diff:
+        if line.startswith('+'):
+            added_lines.append(line[1:])
+    return '\n'.join(added_lines)
+
+def remove_fence(s):
+    o = ''
+    for i in s.splitlines(keepends=True):
+        if '```' not in i:
+            o += i
+    return o
+
 class Chat:
-    def __init__(self, model_path='llama_32_1b_it', system='', c=34, max_kv_size=None):
+    def __init__(self, model_path='llama_32_1b_it', system='', c=34, fim_template=FIM_TEMPLATE, think='noop', max_kv_size='noop', dict_repo='noop', cache_dir='noop'):
         path_hf = snapshot_download(repo_id='JosefAlbers/llama', allow_patterns=[f'{model_path}*'])
         with open(f'{path_hf}/{model_path}_config.json', 'r') as f:
             cfg = json.load(f)
@@ -180,10 +230,11 @@ class Chat:
         self.tokenizer = Tokenizer(f'{path_hf}/{model_path}.tiktoken')
         self.num_layers = cfg['num_hidden_layers']
         self.c = c
+        self.fim_template = fim_template
         self.reset(system=system)
     def get_ntok(self, s):
         return len(self.tokenizer.encode(s)[0])
-    def reset(self, system=''):
+    def reset(self, system='', max_kv_size='noop'):
         self.system = system
         self.toks = None
         self.cache = None
@@ -191,6 +242,16 @@ class Chat:
         self.stop = None
         self.pids = 0
         self.hx = []
+    def fim(self, prefix, suffix, max_new=500, current_path='noop'):
+        self.reset()
+        prompt = self.fim_template.format(prefix=prefix, suffix=suffix)
+        response = self.__call__(inputs=prompt, max_new=max_new, chat_fmt=True, verbose=False, stream=None)
+        autocomplete = remove_fence(response['text'])
+        autocomplete = find_added_lines(''.join([prefix,suffix]), autocomplete)
+        self.reset()
+        return dict(autocomplete=autocomplete, prompt=prompt, prefix=prefix, suffix=suffix, dict_repo={'noop':'noop'})
+    def set_cache_repo(self, dict_repo, cache_dir='noop', max_kv_size='noop'):
+        return 'noop'
     def __call__(self, inputs, max_new=500, chat_fmt=True, verbose=False, stream=None):
         if isinstance(inputs, str):
             if len(inputs) == 0:
@@ -199,7 +260,6 @@ class Chat:
         assert len(inputs) == 1, 'Batching is not implemented yet'
         if chat_fmt:
             chat_fmt = CHAT_INIT if self.cache is None else CHAT_CONT
-            # chat_fmt = chat_fmt.format(date=datetime.now().strftime('%d %b %Y'), system=self.system, text='{text}')
             chat_fmt = subs(chat_fmt, date=datetime.now().strftime('%d %b %Y'), system=self.system)
             inputs = [subs(chat_fmt, text=i) for i in inputs]
         toks = self.tokenizer.encode(inputs)
@@ -265,7 +325,7 @@ class Chat:
         if verbose:
             print(f'\033[{self.c-3}m{'\n\n---\n\n'.join(inputs)}\033[0m---\n\n\033[{self.c}m{'\n\n---\n\n'.join(outputs)}\033[0m\n\n---\n\n{benchmark}')
         text = outputs[0][:-10].strip() if stop == 'stop' else outputs[0].strip()
-        return dict(text=text, outputs=outputs, benchmark=benchmark, stop=stop)
+        return dict(text=text, outputs=outputs, hx=self.hx, benchmark=benchmark, stop=stop)
     def pad_to_batch(self, input_ids):
         max_length = max(len(sublist) for sublist in input_ids)
         toks = mx.array([[128009]*(max_length-len(sublist)) + sublist for sublist in input_ids])
@@ -333,6 +393,18 @@ def main():
     with open(history, "w") as f:
         json.dump(hx, f, indent=4)
 
+def test_fim():
+    prefix = """def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]"""
+    suffix = """middle = [x for x in arr if x == pivot]
+    right = [x for x in arr if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+    """
+    chat = Chat()
+    a = chat.fim(prefix=prefix, suffix=suffix)
+    print(a['autocomplete'])
 
 if __name__ == '__main__':
     main()

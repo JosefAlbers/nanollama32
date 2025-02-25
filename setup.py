@@ -8,7 +8,7 @@ setup(
     url='https://github.com/JosefAlbers/nanollama32',
     py_modules=['nanollama'],
     packages=find_packages(),
-    version='0.0.5',
+    version='0.0.6',
     readme="README.md",
     author_email="albersj66@gmail.com",
     description="Nano Llama",
